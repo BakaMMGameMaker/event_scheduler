@@ -7,14 +7,14 @@
 namespace es {
 
 struct EventID {
-    using ValueType = uint64_t;
-    static constexpr ValueType InvalidID = std::numeric_limits<ValueType>::max();
-    ValueType value;
-    static EventID invalid() noexcept { return EventID{InvalidID}; }
-    bool is_valid() const noexcept { return value != InvalidID; }
-    bool operator==(const EventID &rhs) const noexcept { return value == rhs.value; }
+    static constexpr uint32_t u32max = std::numeric_limits<uint32_t>::max();
+    uint32_t index;
+    uint32_t gen;
+    static EventID invalid() noexcept { return EventID{u32max, u32max}; }
+    bool is_valid() const noexcept { return index != u32max && gen != u32max; }
+    bool operator==(const EventID &rhs) const noexcept { return index == rhs.index && gen == rhs.gen; }
     bool operator!=(const EventID &rhs) const noexcept { return !(*this == rhs); }
-    operator size_t() const noexcept { return static_cast<size_t>(value); }
+    operator size_t() const noexcept { return static_cast<size_t>(index); }
 };
 
 } // namespace es
