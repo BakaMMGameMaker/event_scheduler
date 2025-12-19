@@ -26,8 +26,6 @@ endif()
 # ========= 可执行文件 =========
 add_executable(event_scheduler_demo
     example.cpp
-    event_id.cpp
-    scheduler.cpp
 )
 
 # ========= 头文件路径 =========

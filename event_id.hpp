@@ -10,10 +10,10 @@ struct EventID {
     using ValueType = uint64_t;
     static constexpr ValueType InvalidID = std::numeric_limits<ValueType>::max();
     ValueType value;
-    static EventID invalid() noexcept;
-    bool is_valid() const noexcept;
-    bool operator==(const EventID &rhs) const noexcept;
-    bool operator!=(const EventID &rhs) const noexcept;
+    static EventID invalid() noexcept { return EventID{InvalidID}; }
+    bool is_valid() const noexcept { return value != InvalidID; }
+    bool operator==(const EventID &rhs) const noexcept { return value == rhs.value; }
+    bool operator!=(const EventID &rhs) const noexcept { return !(*this == rhs); }
     operator size_t() const noexcept { return static_cast<size_t>(value); }
 };
 
