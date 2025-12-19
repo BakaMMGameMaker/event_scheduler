@@ -83,8 +83,9 @@ private:
         if (e.status != EventStatus::Alive) return;
 
         call(desc.callback, desc.ep, top); // 这里 call 之后事件不一定仍为 Alive 状态
-        if (e.status == EventStatus::Alive && desc.type == EventType::Repeat) reschedule(top, e);
-        else push_fl(top);
+        if (e.status == EventStatus::Cancelled) return;
+        if (desc.type == EventType::Repeat) reschedule(top, e);
+        else reuse(top);
     }
 
     void print_top(TimeMs delta_ms) const noexcept {
@@ -129,9 +130,12 @@ private:
     }
 
     // 离开 pq 增加 gen
-    void push_fl(EventID eid) noexcept {
+    void reuse(EventID eid) noexcept {
+        const Event &e = events[eid];
+        assert(e.status == EventStatus::Alive);
         fl.push_back(eid.index);
         ++gens[eid];
+        --alive;
     }
 
     // pop 不增加 gen
@@ -145,7 +149,6 @@ private:
         EventID top = pq.top();
         const Event &e = events[top];
         if (e.status != EventStatus::Cancelled) return false;
-
         pq.pop();
         fl.push_back(top.index);
         ++gens[top];
@@ -235,6 +238,7 @@ public:
         Event &e = events[eid];
         if (e.status == EventStatus::Cancelled) return;
         events[eid].status = EventStatus::Cancelled;
+        // 不要在这里回收，如更新 fl 和 gen，因为可能还会碰这个事件
         --alive;
         ++cancelled;
         if (cancelled > alive) rebuild_pq();
