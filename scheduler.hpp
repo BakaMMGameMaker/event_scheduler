@@ -1,3 +1,4 @@
+// scheduler.hpp
 #pragma once
 #include "event.hpp"
 #include "event_id.hpp"
@@ -7,23 +8,30 @@
 
 namespace es {
 class EventScheduler {
-    using EventPool = std::vector<EventDesc>;
+
+    struct Entry {
+        EventDesc desc;
+        TimeMs offset{};
+    };
+
+    using EventPool = std::vector<Entry>;
     struct EventCompare {
         const EventPool &pool_ref;
         explicit EventCompare(const EventPool &pool) : pool_ref(pool) {}
         bool operator()(const EventID &lhs, const EventID &rhs) const {
             // min heap
-            return pool_ref[lhs].delay_ms > pool_ref[rhs].delay_ms;
+            return pool_ref[lhs].desc.delay_ms > pool_ref[rhs].desc.delay_ms;
         }
         friend void swap(EventCompare &, EventCompare &) noexcept {}
     };
     using PQType = std::priority_queue<EventID, std::vector<EventID>, EventCompare>;
 
 private:
-    void pop_repeat() noexcept;
+    void reschedule_top() noexcept;
+    void prepare(Entry &e, TimeMs d) const noexcept;
 
 public:
-    EventScheduler() : events(), pq(EventCompare(events)), current() {}
+    EventScheduler() : entries(), pq(EventCompare(entries)), current() {}
     ~EventScheduler() {}
 
     EventScheduler(const EventScheduler &) = delete;
@@ -45,7 +53,7 @@ public:
     void clear() noexcept;
 
 private:
-    EventPool events;
+    EventPool entries;
     PQType pq;
     TimeMs current{};
 };

@@ -1,5 +1,5 @@
+// event.hpp
 #pragma once
-#include "event_id.hpp"
 #include <cstdint>
 #include <functional>
 
