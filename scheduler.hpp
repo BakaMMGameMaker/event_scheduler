@@ -2,6 +2,7 @@
 #pragma once
 #include "event.hpp"
 #include "event_id.hpp"
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <ctime>
@@ -49,7 +50,7 @@ template <typename Callback = DefaultCallback> class EventScheduler {
     struct Op {
         OpType op_type;
 
-        // for schedule
+        // for schedule in ticking
         TimeMs time_ms;
         Callback f;
         TimeMode mode = TimeMode::Relative;
@@ -57,6 +58,8 @@ template <typename Callback = DefaultCallback> class EventScheduler {
         TimeMs interval_ms = TimeMs{};
         ExceptionPolicy ep = ExceptionPolicy::Swallow;
         EventPriority pri = EventPriority::User;
+
+        EventID eid;
     };
 
     using PQ = std::priority_queue<EventID, std::vector<EventID>, EventCompare>;
@@ -79,8 +82,8 @@ private:
 
         if (e.status != EventStatus::Alive) return;
 
-        call(desc.callback, desc.ep, top);
-        if (desc.type == EventType::Repeat) reschedule(top, e);
+        call(desc.callback, desc.ep, top); // 这里 call 之后事件不一定仍为 Alive 状态
+        if (e.status == EventStatus::Alive && desc.type == EventType::Repeat) reschedule(top, e);
         else push_fl(top);
     }
 
@@ -94,8 +97,14 @@ private:
     }
 
     template <typename F>
-    void set_event(EventType type, TimeMs interval_ms, F &&f, ExceptionPolicy ep, EventPriority pri, EventID eid,
-                   TimeMs next_fire) {
+    void set_event(TimeMs time_ms, TimeMode mode, EventType type, TimeMs interval_ms, F &&f, ExceptionPolicy ep,
+                   EventPriority pri, EventID eid) {
+        // 计算绝对触发时间（这里是第一次触发的时间）
+        TimeMs next_fire;
+        if (mode == TimeMode::Absolute) next_fire = time_ms;
+        else next_fire = current + time_ms;
+
+        // 更新调度器
         Desc desc{type, interval_ms, Callback(std::forward<F>(f)), ep, pri};
         events[eid] = Event{desc, EventStatus::Alive, next_fire};
         pq.push(eid);
@@ -136,8 +145,20 @@ private:
         EventID top = pq.top();
         const Event &e = events[top];
         if (e.status != EventStatus::Cancelled) return false;
+
         pq.pop();
+        fl.push_back(top.index);
         ++gens[top];
+        --cancelled;
+        return true;
+    }
+
+    // 尝试重用 cancel 节点
+    bool try_reuse(EventID eid) {
+        const Event &e = events[eid];
+        if (e.status != EventStatus::Cancelled) return false;
+        fl.push_back(eid.index);
+        ++gens[eid];
         return true;
     }
 
@@ -145,9 +166,8 @@ private:
         PQ tmp = PQ(EventCompare(events));
         while (!pq.empty()) {
             EventID eid = pq.top();
-            const Event &e = events[eid];
-            if (e.status != EventStatus::Cancelled) tmp.push(eid);
             pq.pop();
+            if (!try_reuse(eid)) tmp.push(eid);
         }
         pq.swap(tmp);
         cancelled = 0;
@@ -163,18 +183,21 @@ private:
     bool try_add_ops(
         OpType op_type, TimeMs time_ms = 0, F &&f = [] {}, TimeMode mode = TimeMode::Relative,
         EventType event_type = EventType::Once, TimeMs interval_ms = TimeMs{},
-        ExceptionPolicy ep = ExceptionPolicy::Swallow, EventPriority pri = EventPriority::User) {
+        ExceptionPolicy ep = ExceptionPolicy::Swallow, EventPriority pri = EventPriority::User,
+        EventID eid = EventID::invalid()) {
         if (!ticking) return false;
-        Op op{op_type, time_ms, Callback(std::forward<F>(f)), mode, event_type, interval_ms, ep, pri};
+        Op op{op_type, time_ms, Callback(std::forward<F>(f)), mode, event_type, interval_ms, ep, pri, eid};
         delay_ops.emplace_back(std::move(op));
         return true;
     }
 
-    template <typename F> void call_delay_ops() {
-        for (Op &op : delay_ops) {
-            if (op.op_type == OpType::Add)
-                schedule(op.time_ms, std::forward<F>(op.f), op.mode, op.event_type, op.interval_ms, op.ep, op.pri);
-            else if (op.op_type == OpType::Clear) clear();
+    void flush_delay_ops() {
+        Ops ops;
+        ops.swap(delay_ops); // 清空 delay_ops 同时仍能继续遍历
+        for (Op &op : ops) {
+            if (op.op_type == OpType::Add) // 这里 move op.f 没事，因为本来 op 就是临时对象
+                set_event(op.time_ms, op.mode, op.event_type, op.interval_ms, std::move(op.f), op.ep, op.pri, op.eid);
+            else if (op.op_type == OpType::Clear) clear(); // 不 return，确保后面的 schedule 被处理
         }
     }
 
@@ -184,6 +207,8 @@ public:
 
     EventScheduler(const EventScheduler &) = delete;
     EventScheduler &operator=(const EventScheduler &) = delete;
+    EventScheduler(EventScheduler &&) = delete;
+    EventScheduler &operator=(EventScheduler &&) = delete;
 
     // 添加事件
     template <typename F>
@@ -191,15 +216,16 @@ public:
                      TimeMs interval_ms = TimeMs{}, ExceptionPolicy ep = ExceptionPolicy::Swallow,
                      EventPriority pri = EventPriority::User) {
         static_assert(std::is_invocable_r_v<void, F &>, "callback must be invocable with signature void()");
+
+        // 获取事件最终的 eid
         EventID eid;
         if (fl.empty()) eid = append();
         else eid = pop_fl();
 
         // 处理正在 ticking 的情况
-        if (try_add_ops(OpType::Add, time_ms, std::forward<F>(f), mode, type, interval_ms, ep, pri)) return eid;
+        if (try_add_ops(OpType::Add, time_ms, std::forward<F>(f), mode, type, interval_ms, ep, pri, eid)) return eid;
 
-        TimeMs next_fire = (mode == TimeMode::Absolute) ? time_ms : current + time_ms;
-        set_event(type, interval_ms, std::forward<F>(f), ep, pri, eid, next_fire);
+        set_event(time_ms, mode, type, interval_ms, std::forward<F>(f), ep, pri, eid);
         return eid;
     }
 
@@ -242,7 +268,7 @@ public:
             fire_top();
         }
         ticking = false;
-        call_delay_ops<Callback>();
+        flush_delay_ops();
     }
 
     void tick_until(TimeMs end_time) {
@@ -280,14 +306,14 @@ public:
         pq.swap(tmp);
         fl.clear();
         gens.clear();
-        delay_ops.clear();
+        assert(delay_ops.empty());
         current = TimeMs{};
         // paused_time = TimeMs{}; // 不知道要不要处理这玩意儿
         alive = 0;
         cancelled = 0;
         fire_count_ = 0;
         // paused = false;
-        ticking = false;
+        assert(!ticking);
     }
 
     // 暂停/恢复
