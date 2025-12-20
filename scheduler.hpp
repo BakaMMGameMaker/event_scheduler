@@ -30,7 +30,7 @@ template <typename Callback = DefaultCallback> class EventScheduler {
 
     struct EventCompare {
         const Events &events;
-        explicit EventCompare(const Events &pool) : events(pool) {}
+        explicit EventCompare(const Events &es) : events(es) {}
         bool tie_break(const EventID &lhs, const EventID &rhs) const noexcept {
             const Event &le = events[lhs];
             const Event &re = events[rhs];
@@ -62,6 +62,16 @@ template <typename Callback = DefaultCallback> class EventScheduler {
         EventID eid;
     };
 
+    struct TickGuard {
+        EventScheduler *es;
+        bool flush = true;
+        explicit TickGuard(EventScheduler *_es, bool _flush) : es(_es), flush(_flush) { es->ticking = true; }
+        ~TickGuard() noexcept(false) {
+            es->ticking = false;
+            if (flush) es->flush_delay_ops();
+        }
+    };
+
     using PQ = std::priority_queue<EventID, std::vector<EventID>, EventCompare>;
     using FL = std::vector<uint32_t>;
     using Gens = std::vector<uint32_t>;
@@ -82,7 +92,17 @@ private:
 
         if (e.status != EventStatus::Alive) return;
 
-        call(desc.callback, desc.ep, top); // 这里 call 之后事件不一定仍为 Alive 状态
+        try {
+            call(desc.callback, desc.ep, top); // 这里 call 之后事件不一定仍为 Alive 状态
+        } catch (...) {
+            // 若在此处捕获，说明 Policy 为 rethrow
+            // rethrow 只是重新抛出，不代表事件会被自动取消
+            if (e.status == EventStatus::Cancelled) throw;
+            if (desc.type == EventType::Repeat) reschedule(top, e);
+            else reuse(top);
+            throw;
+        }
+
         if (e.status == EventStatus::Cancelled) return;
         if (desc.type == EventType::Repeat) reschedule(top, e);
         else reuse(top);
@@ -166,7 +186,7 @@ private:
     }
 
     void rebuild_pq() {
-        PQ tmp = PQ(EventCompare(events));
+        PQ tmp{EventCompare(events)};
         while (!pq.empty()) {
             EventID eid = pq.top();
             pq.pop();
@@ -200,8 +220,28 @@ private:
         for (Op &op : ops) {
             if (op.op_type == OpType::Add) // 这里 move op.f 没事，因为本来 op 就是临时对象
                 set_event(op.time_ms, op.mode, op.event_type, op.interval_ms, std::move(op.f), op.ep, op.pri, op.eid);
-            else if (op.op_type == OpType::Clear) clear(); // 不 return，确保后面的 schedule 被处理
+            else if (op.op_type == OpType::Clear) clear_in_tick(); // 不 return，确保后面的 schedule 被处理
         }
+    }
+
+    void clear_in_tick() noexcept {
+        PQ tmp{EventCompare(events)};
+        pq.swap(tmp);
+
+        // pq 已经为空，不用担心 try pop cancel 带来的问题
+        fl.clear();
+        fl.reserve(events.size());
+        for (uint32_t i = 0; i < events.size(); ++i) {
+            ++gens[i];
+            events[i].status = EventStatus::Cancelled;
+            fl.push_back(i);
+        }
+
+        current = TimeMs{};
+        paused_time = TimeMs{};
+        alive = 0;
+        cancelled = 0;
+        fire_count_ = 0;
     }
 
 public:
@@ -260,7 +300,7 @@ public:
         // tick 中 cancel 同一时刻且未被触发的事件，则被 cancel 的事件不会被触发
 
         if (try_update_pause(delta_ms)) return;
-        ticking = true;
+        TickGuard tg(this, true); // RAII guard
         current += delta_ms;
         while (!pq.empty()) {
             // 提前防止 Cancelled 堆积
@@ -271,8 +311,7 @@ public:
             if (current < e.next_fire) break;
             fire_top();
         }
-        ticking = false;
-        flush_delay_ops();
+        // 出去之后，ticking = false, delay ops 都完成
     }
 
     void tick_until(TimeMs end_time) {
@@ -304,19 +343,21 @@ public:
 
     // 清空所有事件
     void clear() noexcept {
+        // 处理 ticking 情况
         if (try_add_ops<Callback>(OpType::Clear)) return;
+
         events.clear();
-        PQ tmp = PQ(EventCompare(events));
+        PQ tmp{EventCompare(events)};
         pq.swap(tmp);
         fl.clear();
         gens.clear();
         assert(delay_ops.empty());
         current = TimeMs{};
-        // paused_time = TimeMs{}; // 不知道要不要处理这玩意儿
+        paused_time = TimeMs{};
         alive = 0;
         cancelled = 0;
         fire_count_ = 0;
-        // paused = false;
+        paused = false;
         assert(!ticking);
     }
 

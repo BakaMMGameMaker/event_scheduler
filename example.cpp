@@ -376,16 +376,11 @@ static void test_fuzz_once_only() {
 // Known sharp edges / demos (disabled)
 // -----------------------------
 
-#if 0
-// 你现在的实现里，callback ep==Rethrow 会把异常抛出 tick，
-// 但 tick 没有 RAII guard 来恢复 ticking=false + flush_delay_ops。
-// 这会导致“异常后 schedule 的事件被当成 tick 内 schedule，从而被延迟处理”等行为偏差。
-// 这个 demo 默认关掉，免得你跑一次就开始骂我。
-static void demo_rethrow_leaves_scheduler_in_weird_state() {
+static void test_rethrow() {
     Scheduler s;
-    s.schedule(10, [] { throw std::runtime_error("rethrow"); },
-               TimeMode::Relative, EventType::Once, 0,
-               ExceptionPolicy::Rethrow, EventPriority::User);
+    s.schedule(
+        10, [] { throw std::runtime_error("rethrow"); }, TimeMode::Relative, EventType::Once, 0,
+        ExceptionPolicy::Rethrow, EventPriority::User);
 
     try {
         s.tick(10);
@@ -399,7 +394,6 @@ static void demo_rethrow_leaves_scheduler_in_weird_state() {
         EXPECT_EQ(cnt, size_t(1));
     }
 }
-#endif
 
 int main() {
     test_basic_order_and_tie_break();
@@ -412,6 +406,7 @@ int main() {
     test_rebuild_and_generation_safety();
     test_clear_resets();
     test_fuzz_once_only();
+    test_rethrow();
 
     print_summary();
 
