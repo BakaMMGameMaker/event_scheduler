@@ -5,7 +5,7 @@
 
 namespace es {
 
-using TimeMs = uint64_t;
+using TimeMs = int64_t;
 
 enum class EventType : uint8_t { Once, Repeat };
 enum class TimeMode : uint8_t { Relative, Absolute };

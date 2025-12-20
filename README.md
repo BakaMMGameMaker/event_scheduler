@@ -9,4 +9,7 @@
 8.tick 中 clear 之前 schedule 的事件的 eid 是无效的
 9.resume 会一次性 tick 已经暂停的时间
 10.tick 中的 schedule 和 clear 操作会等到本次 tick 的末尾再一次性处理
-11.tick 中发生异常且抛出时，会立即执行所有抛出点前且在本 tick 内的 schedule 和 clear 操作
+11.tick 中回调抛出时，会立即执行所有抛出点前且在本 tick 内的 schedule 和 clear 操作
+12.tick 中回调抛出时，如果抛出的事件为 Once，事件节点会被照常回收，如果为 Repeat，则重新调度
+13.取消事件时，事件节点不会被立即回收，而是等到 tick 中遇到时懒回收
+14.set_next_fire 和 delay 接口

@@ -261,7 +261,7 @@ static void test_rebuild_and_generation_safety() {
     // schedule 10 once events far in future
     std::vector<EventID> ids;
     ids.reserve(10);
-    for (size_t i = 0; i < 10; ++i) {
+    for (int i = 0; i < 10; ++i) {
         ids.push_back(s.schedule(10'000 + i, [] {}));
     }
     EXPECT_EQ(s.size(), size_t(10));
@@ -277,7 +277,7 @@ static void test_rebuild_and_generation_safety() {
     std::set<uint32_t> reused_indices;
     std::vector<EventID> new_ids;
     new_ids.reserve(9);
-    for (size_t i = 0; i < 9; ++i) {
+    for (int i = 0; i < 9; ++i) {
         EventID nid = s.schedule(1 + i, [] {});
         new_ids.push_back(nid);
         reused_indices.insert(nid.index);
@@ -350,7 +350,7 @@ static void test_fuzz_once_only() {
             if (items.empty()) continue;
             std::uniform_int_distribution<size_t> pick(0, items.size() - 1);
             size_t i = pick(rng);
-            s.cancel(items[i].id);
+            if (items[i].id.is_valid() && s.is_alive(items[i].id)) s.cancel(items[i].id);
             items[i].alive = false;
         } else {
             s.tick(static_cast<TimeMs>(
@@ -396,7 +396,9 @@ static void test_rethrow() {
 }
 
 int main() {
-    // todo: 添加测试：Repeat 且 interval = 0 的事件一次 tick 只会触发一次
+    // todo: 添加测试：
+    // 1. Repeat 且 interval = 0 的事件一次 tick 只会触发一次
+    // 2. schedule at (t < now) 不应该立即触发，至少 tick(0) 后才会触发
     test_basic_order_and_tie_break();
     test_absolute_time();
     test_priority_order();
