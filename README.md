@@ -9,3 +9,4 @@
 8.tick 中 clear 之前 schedule 的事件的 eid 是无效的
 9.resume 会一次性 tick 已经暂停的时间
 10.tick 中的 schedule 和 clear 操作会等到本次 tick 的末尾再一次性处理
+11.tick 中发生异常且抛出时，会立即执行所有抛出点前且在本 tick 内的 schedule 和 clear 操作

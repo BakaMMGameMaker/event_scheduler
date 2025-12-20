@@ -1,6 +1,5 @@
 // event_id.hpp
 #pragma once
-#include <cstddef>
 #include <cstdint>
 #include <limits>
 
@@ -14,7 +13,6 @@ struct EventID {
     bool is_valid() const noexcept { return index != u32max && gen != u32max; }
     bool operator==(const EventID &rhs) const noexcept { return index == rhs.index && gen == rhs.gen; }
     bool operator!=(const EventID &rhs) const noexcept { return !(*this == rhs); }
-    operator size_t() const noexcept { return static_cast<size_t>(index); }
 };
 
 } // namespace es
