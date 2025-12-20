@@ -311,7 +311,7 @@ static void test_clear_resets() {
 
     EXPECT_EQ(s.now(), TimeMs(0));
     EXPECT_EQ(s.size(), size_t(0));
-    EXPECT_EQ(s.fire_count(), size_t(0));
+    EXPECT_EQ(s._fire_count(), size_t(0));
 
     s.tick(2000);
     EXPECT_EQ(cnt, size_t(0));
