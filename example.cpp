@@ -19,6 +19,7 @@ using TimeMode = es::TimeMode;
 using EventType = es::EventType;
 using ExceptionPolicy = es::ExceptionPolicy;
 using EventPriority = es::EventPriority;
+using CatchUp = es::CatchUp;
 
 static int g_failed = 0;
 
@@ -395,10 +396,93 @@ static void test_rethrow() {
     }
 }
 
+static void test_clear_then_schedule_in_same_tick() {
+    Scheduler s;
+    Trace t;
+
+    EventID id_before = EventID::invalid();
+    EventID id_after1 = EventID::invalid();
+    EventID id_after2 = EventID::invalid();
+
+    // 10ms 时触发，回调里做：
+    // schedule(before-clear), clear, schedule(after-clear)
+    s.schedule(10, [&] {
+        t.push("A");
+
+        id_before = s.schedule(0, [&] { t.push("BEFORE"); }); // should be invalidated by clear
+        s.clear();                                            // delayed op (in tick)
+
+        id_after1 = s.schedule(0, [&] { t.push("AFTER1"); }); // should survive
+        id_after2 = s.schedule(0, [&] { t.push("AFTER2"); }); // should survive
+    });
+
+    s.tick(10);
+    // tick 内 schedule(0) 不会在同一次 tick 触发，所以这里只看到 A
+    expect_seq(t.log, {"A"});
+
+    // flush 完后：before-clear 的 eid 应该 stale；after-clear 的 eid 应该 alive
+    EXPECT(!s.is_alive(id_before));
+    EXPECT(s.is_alive(id_after1));
+    EXPECT(s.is_alive(id_after2));
+
+    // 下一次 tick(0) 才会触发 AFTER1/AFTER2
+    s.tick(0);
+
+    // 顺序按 index / priority tie-break。我们不强行要求 AFTER1/AFTER2 的先后，只要它们都出现且 BEFORE 没出现。
+    bool saw_before = false, saw_after1 = false, saw_after2 = false;
+    for (auto &x : t.log) {
+        if (x == "BEFORE") saw_before = true;
+        if (x == "AFTER1") saw_after1 = true;
+        if (x == "AFTER2") saw_after2 = true;
+    }
+
+    EXPECT(!saw_before);
+    EXPECT(saw_after1);
+    EXPECT(saw_after2);
+    EXPECT_EQ(s.size(), size_t(0));
+}
+
+static void test_double_clear_then_schedule_in_same_tick() {
+    Scheduler s;
+    Trace t;
+
+    EventID id_after = EventID::invalid();
+
+    s.schedule(10, [&] {
+        t.push("A");
+        s.clear();
+        s.clear();
+        id_after = s.schedule(0, [&] { t.push("AFTER"); });
+    });
+
+    s.tick(10);
+    expect_seq(t.log, {"A"});
+
+    EXPECT(s.is_alive(id_after));
+    s.tick(0);
+    // AFTER 应该触发一次
+    bool saw_after = false;
+    for (auto &x : t.log)
+        if (x == "AFTER") saw_after = true;
+    EXPECT(saw_after);
+    EXPECT_EQ(s.size(), size_t(0));
+}
+
+static void demo_assert_bug_repeat_latest_not_due() {
+    Scheduler s;
+    Trace t;
+
+    // 未来 100ms 触发 repeat，Latest
+    s.schedule_after(
+        100, [&] { t.push("R"); }, EventType::Repeat, 50, ExceptionPolicy::Swallow, EventPriority::User,
+        CatchUp::Latest);
+
+    // 还没到 100ms，这里不应该做任何事，更不应该 assert 炸掉
+    s.tick(10);
+    EXPECT(t.log.empty());
+}
+
 int main() {
-    // todo: 添加测试：
-    // 1. Repeat 且 interval = 0 的事件一次 tick 只会触发一次
-    // 2. schedule at (t < now) 不应该立即触发，至少 tick(0) 后才会触发
     test_basic_order_and_tie_break();
     test_absolute_time();
     test_priority_order();
@@ -410,6 +494,9 @@ int main() {
     test_clear_resets();
     test_fuzz_once_only();
     test_rethrow();
+    test_clear_then_schedule_in_same_tick(); // <- 已经发现这里有段错误
+    test_double_clear_then_schedule_in_same_tick();
+    demo_assert_bug_repeat_latest_not_due();
 
     print_summary();
 

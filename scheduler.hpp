@@ -59,11 +59,15 @@ template <typename Callback = DefaultCallback> class EventScheduler {
 
     struct TickGuard {
         EventScheduler *es;
-        bool flush = true;
-        explicit TickGuard(EventScheduler *_es, bool _flush) : es(_es), flush(_flush) { es->ticking = true; }
+        explicit TickGuard(EventScheduler *_es) : es(_es) {
+            es->ticking = true;
+            es->delay_ops.clear();
+            es->pending_clear = 0;
+        }
         ~TickGuard() {
             es->ticking = false;
-            if (flush) es->flush_delay_ops();
+            es->flush_delay_ops();
+            es->pending_clear = 0;
         }
     };
 
@@ -148,6 +152,7 @@ private:
 
     bool try_add_ops(OpType op_type, TimeMs next_fire = 0, Desc &&d = Desc{}, EventID eid = EventID::invalid()) {
         if (!ticking) return false;
+        if (op_type == OpType::Clear) ++pending_clear;
 
         Op op;
         op.op_type = op_type;
@@ -159,19 +164,15 @@ private:
     }
 
     void flush_delay_ops() noexcept {
-        size_t gen_off = 0; // gen 偏移
         Ops ops;
         ops.swap(delay_ops); // 清空 delay_ops 同时仍能继续遍历
         for (Op &op : ops) {
-            if (try_clear_in_tick(op, gen_off)) continue;
-            // op_type == Add vvv
-            op.eid.gen -= gen_off; // 把 clear 导致的 gen 偏移拉回来，确保和用户拿到的 gen 一致
-            // op 是临时对象，所以 move op.f
-            set_event(op.next_fire, std::move(op.desc), op.eid);
+            if (op.op_type == OpType::Clear) clear_in_tick(op);
+            else set_event(op.next_fire, std::move(op.desc), op.eid);
         }
     }
 
-    bool try_clear_in_tick(const Op &op, size_t &gen_off) noexcept {
+    bool clear_in_tick(const Op &op) noexcept {
         if (op.op_type != OpType::Clear) return false;
 
         PQ tmp{EventCompare(events)};
@@ -191,7 +192,6 @@ private:
         alive = 0;
         cancelled = 0;
         fire_count = 0;
-        ++gen_off;
         return true;
     }
 
@@ -204,7 +204,7 @@ private:
 
         // 把 Repeat 类的事件的 next_fire 更新到最后一次触发时刻
         TimeMs delta = current - e.next_fire;
-        assert(delta >= 0);
+        if (delta <= 0) return false;
         int ts = static_cast<int>(delta / d.interval_ms); // 周期
         if (ts == 0) return false;                        // 确保会被触发
 
@@ -232,7 +232,8 @@ private:
 
     template <typename F>
     static constexpr bool is_valid_callback_t =
-        std::is_invocable_r_v<void, F &> || std::is_invocable_r_v<void, F &, EventID>;
+        std::is_constructible_v<Callback, F> &&
+        (std::is_invocable_r_v<void, F &> || std::is_invocable_r_v<void, F &, EventID>);
 
 public:
     EventScheduler() : events(), pq(EventCompare(events)) {}
@@ -247,15 +248,14 @@ public:
     EventID schedule_after(TimeMs time_ms, F &&f, EventType type = EventType::Once, TimeMs interval_ms = TimeMs{},
                            ExceptionPolicy ep = ExceptionPolicy::Swallow, EventPriority pri = EventPriority::User,
                            CatchUp cu = CatchUp::All) {
-        static_assert(is_valid_callback_t<F>, "callback must be invocable with signature void() / void(EventID)");
+        static_assert(is_valid_callback_t<F>,
+                      "callback must be invocable with signature void() / void(EventID)，而且能用于构造 Callback 对象");
         assert(!(type == EventType::Repeat && interval_ms <= 0)); // 防止同一 tick 重复触发某一 Repeat 事件
 
         // 获取事件最终的 eid
         EventID eid;
         if (fl.empty()) eid = append();
         else eid = pop_fl();
-        // 获取 eid 时，其 gen 应该等于列表中记录的 gen
-        assert(eid.gen == gens[eid.index]);
 
         Desc d;
         d.type = type;
@@ -267,7 +267,12 @@ public:
 
         TimeMs next_fire = current + time_ms;
 
-        // 根据是否 ticking 分别处理
+        // 处理 ticking clear 带来的 gen 偏移
+        assert(!(ticking == false && pending_clear != 0));
+        assert(eid.gen == gens[eid.index]);
+        eid.gen += pending_clear;
+        gens[eid.index] += pending_clear;
+
         if (try_add_ops(OpType::Add, next_fire, std::move(d), eid)) return eid;
         set_event(next_fire, std::move(d), eid);
         return eid;
@@ -350,12 +355,12 @@ public:
     // 推进时间
     void tick(TimeMs delta_ms) {
         if (try_update_pause(delta_ms)) return;
-        TickGuard tg(this, true); // RAII guard
+        TickGuard tg(this); // RAII guard
         current += delta_ms;
         while (!pq.empty()) {
             if (try_pop_cancelled()) continue; // 处理 Cancelled 堆顶
+            if (try_skip_old()) continue;      // 跳过旧事件，注意顺序
             if (try_skip_repeat()) continue;   // CatchUp = Latest 时，跳过重复 repeat 事件
-            if (try_skip_old()) continue;      // 跳过旧事件
 
             EventID top = pq.top();
             const Event &e = events[top.index];
@@ -363,7 +368,6 @@ public:
             if (current < e.next_fire) break;
             fire_top();
         }
-        // 出去之后，ticking = false, delay ops 都完成
     }
 
     void tick_until(TimeMs end_time) {
@@ -382,6 +386,7 @@ public:
 
     void run() {
         if (paused) return;
+        TickGuard tg(this);
         while (!pq.empty()) {
             if (try_pop_cancelled()) continue;
             if (try_skip_repeat()) continue;
@@ -398,6 +403,8 @@ public:
     TimeMs now() const noexcept { return current; }
     TimeMs paused_time() const noexcept { return paused_time_; }
     size_t size() const noexcept { return alive; }
+    size_t num_cancelled() const noexcept { return cancelled; }
+    size_t num_pending_clear() const noexcept { return pending_clear; }
 
     // 清空所有事件
     void clear() noexcept {
@@ -509,6 +516,7 @@ private:
     TimeMs paused_time_{};
     size_t alive{};
     size_t cancelled{};
+    size_t pending_clear{}; // delay ops 中未执行的 clear，用于防止 gen 漂移
     size_t fire_count{};
     bool paused = false;
     bool ticking = false;
