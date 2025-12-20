@@ -15,11 +15,11 @@ enum class EventPriority : uint8_t { System, User, Debug };
 using DefaultCallback = std::function<void()>;
 
 template <typename Callback = DefaultCallback> struct EventDesc {
-    EventType type;
-    TimeMs interval_ms; // 仅限 Repeat 使用
-    Callback callback;
-    ExceptionPolicy ep;
-    EventPriority pri;
+    EventType type = EventType::Once;
+    TimeMs interval_ms = TimeMs{}; // 仅限 Repeat 使用
+    Callback callback = std::function<void()>{};
+    ExceptionPolicy ep = ExceptionPolicy::Swallow;
+    EventPriority pri = EventPriority::User;
 };
 
 } // namespace es

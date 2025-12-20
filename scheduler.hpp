@@ -22,8 +22,8 @@ template <typename Callback = DefaultCallback> class EventScheduler {
 
     struct Event {
         Desc desc;
-        EventStatus status;
-        TimeMs next_fire;
+        EventStatus status = EventStatus::Cancelled;
+        TimeMs next_fire = TimeMs{};
     };
 
     using Events = std::vector<Event>;
@@ -99,13 +99,13 @@ private:
             // rethrow 只是重新抛出，不代表事件会被自动取消
             if (e.status == EventStatus::Cancelled) throw;
             if (desc.type == EventType::Repeat) reschedule(top, e);
-            else reuse(top);
+            else reuse_once(top);
             throw;
         }
 
         if (e.status == EventStatus::Cancelled) return;
         if (desc.type == EventType::Repeat) reschedule(top, e);
-        else reuse(top);
+        else reuse_once(top);
     }
 
     void print_top(TimeMs delta_ms) const noexcept {
@@ -149,10 +149,11 @@ private:
         return eid;
     }
 
-    // 离开 pq 增加 gen
-    void reuse(EventID eid) noexcept {
-        const Event &e = events[eid];
+    // 回收 Once 事件
+    void reuse_once(EventID eid) noexcept {
+        Event &e = events[eid];
         assert(e.status == EventStatus::Alive);
+        e.status = EventStatus::Cancelled; // 不再 Alive
         fl.push_back(eid.index);
         ++gens[eid];
         --alive;
@@ -186,6 +187,8 @@ private:
     }
 
     void rebuild_pq() {
+        size_t old_pq_size = pq.size();
+        size_t old_fl_size = fl.size();
         PQ tmp{EventCompare(events)};
         while (!pq.empty()) {
             EventID eid = pq.top();
@@ -193,6 +196,7 @@ private:
             if (!try_reuse(eid)) tmp.push(eid);
         }
         pq.swap(tmp);
+        assert(old_pq_size - pq.size() == fl.size() - old_fl_size);
         cancelled = 0;
     }
 
@@ -260,10 +264,14 @@ public:
                      EventPriority pri = EventPriority::User) {
         static_assert(std::is_invocable_r_v<void, F &>, "callback must be invocable with signature void()");
 
+        assert(!(type == EventType::Repeat && interval_ms == 0)); // 防止同一 tick 重复触发某一 Repeat 事件
+
         // 获取事件最终的 eid
         EventID eid;
         if (fl.empty()) eid = append();
         else eid = pop_fl();
+        // 获取 eid 时，其 gen 应该等于列表中记录的 gen
+        assert(eid.gen == gens[eid]);
 
         // 处理正在 ticking 的情况
         if (try_add_ops(OpType::Add, time_ms, std::forward<F>(f), mode, type, interval_ms, ep, pri, eid)) return eid;
@@ -320,6 +328,13 @@ public:
         tick(delta_ms);
     }
 
+    // 获取最近事件的 id 和触发时间
+    auto peek() const noexcept -> std::pair<EventID, TimeMs> {
+        EventID eid = pq.top();
+        const Event &e = events[eid];
+        return {eid, e.next_fire};
+    }
+
     void run() {
         if (paused) return;
         while (!pq.empty()) {
@@ -369,6 +384,9 @@ public:
         tick(paused_time);
         paused_time = 0;
     }
+
+    size_t _fl_size() const noexcept { return fl.size(); }
+    size_t _pq_size() const noexcept { return pq.size(); }
 
 private:
     Events events;

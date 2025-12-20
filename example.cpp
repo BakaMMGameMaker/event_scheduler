@@ -396,6 +396,7 @@ static void test_rethrow() {
 }
 
 int main() {
+    // todo: 添加测试：Repeat 且 interval = 0 的事件一次 tick 只会触发一次
     test_basic_order_and_tie_break();
     test_absolute_time();
     test_priority_order();
