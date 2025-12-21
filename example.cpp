@@ -2,6 +2,7 @@
 #include "event.hpp"
 #include "event_id.hpp"
 #include "scheduler.hpp"
+#include <Windows.h>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -296,8 +297,8 @@ static void test_rebuild_and_generation_safety() {
 
     // And the original alive one still triggers at 10000+
     size_t marker = 0;
-    EventID far = ids[9];
-    s.cancel(far); // make it quiet and end
+    EventID far_id = ids[9];
+    s.cancel(far_id); // make it quiet and end
     EXPECT_EQ(s.size(), size_t(0));
     (void)marker;
 }
@@ -408,7 +409,6 @@ static void test_clear_then_schedule_in_same_tick() {
     // schedule(before-clear), clear, schedule(after-clear)
     s.schedule(10, [&] {
         t.push("A");
-
         id_before = s.schedule(0, [&] { t.push("BEFORE"); }); // should be invalidated by clear
         s.clear();                                            // delayed op (in tick)
 
@@ -424,6 +424,8 @@ static void test_clear_then_schedule_in_same_tick() {
     EXPECT(!s.is_alive(id_before));
     EXPECT(s.is_alive(id_after1));
     EXPECT(s.is_alive(id_after2));
+    EXPECT(s.size() == 2);
+    EXPECT(s._pq_size() >= 2);
 
     // 下一次 tick(0) 才会触发 AFTER1/AFTER2
     s.tick(0);
@@ -483,6 +485,9 @@ static void demo_assert_bug_repeat_latest_not_due() {
 }
 
 int main() {
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+
     test_basic_order_and_tie_break();
     test_absolute_time();
     test_priority_order();
@@ -494,7 +499,7 @@ int main() {
     test_clear_resets();
     test_fuzz_once_only();
     test_rethrow();
-    test_clear_then_schedule_in_same_tick(); // <- 已经发现这里有段错误
+    test_clear_then_schedule_in_same_tick();
     test_double_clear_then_schedule_in_same_tick();
     demo_assert_bug_repeat_latest_not_due();
 

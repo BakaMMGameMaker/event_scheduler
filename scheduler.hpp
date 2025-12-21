@@ -16,7 +16,7 @@
 namespace es {
 
 enum class EventStatus : uint8_t { Alive, Cancelled };
-enum class OpType : uint8_t { Add, Clear };
+enum class OpType : uint8_t { Schedule, Clear };
 
 template <typename Callback = DefaultCallback> class EventScheduler {
 
@@ -28,7 +28,7 @@ template <typename Callback = DefaultCallback> class EventScheduler {
         TimeMs next_fire = TimeMs{};
     };
 
-    using Events = std::vector<Event>;
+    using Events = std::deque<Event>; // 防止扩容 Callback 搬家
 
     struct EventCompare {
         const Events &events;
@@ -51,7 +51,7 @@ template <typename Callback = DefaultCallback> class EventScheduler {
 
     struct Op {
         OpType op_type;
-        // for schedule in ticking
+        // for schedule
         TimeMs next_fire;
         Desc desc;
         EventID eid;
@@ -61,8 +61,8 @@ template <typename Callback = DefaultCallback> class EventScheduler {
         EventScheduler *es;
         explicit TickGuard(EventScheduler *_es) : es(_es) {
             es->ticking = true;
-            es->delay_ops.clear();
-            es->pending_clear = 0;
+            assert(es->delay_ops.empty());
+            assert(es->pending_clear == 0);
         }
         ~TickGuard() {
             es->ticking = false;
@@ -73,6 +73,7 @@ template <typename Callback = DefaultCallback> class EventScheduler {
 
     using PQ = std::priority_queue<EventID, std::vector<EventID>, EventCompare>;
     using FL = std::vector<uint32_t>;
+    using Idxs = std::vector<uint32_t>;
     using Gens = std::vector<uint32_t>;
     using Ops = std::vector<Op>;
 
@@ -150,49 +151,75 @@ private:
         return true;
     }
 
-    bool try_add_ops(OpType op_type, TimeMs next_fire = 0, Desc &&d = Desc{}, EventID eid = EventID::invalid()) {
-        if (!ticking) return false;
-        if (op_type == OpType::Clear) ++pending_clear;
-
+    void add_clear() {
+        ++pending_clear;
+        delay_ops.clear(); // 最后一次 clear 之前的操作都是没有意义的
         Op op;
-        op.op_type = op_type;
+        op.op_type = OpType::Clear;
+        delay_ops.emplace_back(std::move(op));
+    }
+
+    void add_schedule(TimeMs next_fire, Desc &&d, EventID eid) {
+        Op op;
+        op.op_type = OpType::Schedule;
         op.next_fire = next_fire;
         op.desc = std::move(d);
         op.eid = eid;
         delay_ops.emplace_back(std::move(op));
-        return true;
     }
 
-    void flush_delay_ops() noexcept {
+    void handle_clear_op(const Ops &ops, size_t i) {
+        // Clear 操作应该在整个 delay_ops 中的首个位置
+        assert(i == 0);
+
+        // 收集 resevered 槽位
+        Idxs reserved_indices;
+        for (size_t j = 1; j < ops.size(); ++j) {
+            const Op &op = ops[j];
+            assert(op.op_type == OpType::Schedule);
+            reserved_indices.push_back(op.eid.index);
+        }
+        clear_in_tick(reserved_indices);
+    }
+
+    void flush_delay_ops() {
         Ops ops;
         ops.swap(delay_ops); // 清空 delay_ops 同时仍能继续遍历
-        for (Op &op : ops) {
-            if (op.op_type == OpType::Clear) clear_in_tick(op);
+        for (size_t i = 0; i < ops.size(); ++i) {
+            Op &op = ops[i];
+            if (op.op_type == OpType::Clear) handle_clear_op(ops, i);
             else set_event(op.next_fire, std::move(op.desc), op.eid);
         }
     }
 
-    bool clear_in_tick(const Op &op) noexcept {
-        if (op.op_type != OpType::Clear) return false;
-
+    // 一个 tick 内只会执行一次
+    void clear_in_tick(const Idxs &reserved_indices) noexcept {
+        // 清空 pq
         PQ tmp{EventCompare(events)};
         pq.swap(tmp);
 
-        // pq 已经为空，不用担心 try pop cancel 带来的问题
-        fl.clear();
-        fl.reserve(events.size());
-        for (uint32_t i = 0; i < events.size(); ++i) {
-            ++gens[i];
-            events[i].status = EventStatus::Cancelled;
-            fl.push_back(i);
+        // 标记预定槽位
+        std::vector<uint8_t> reserved(events.size(), 0);
+        for (uint32_t idx : reserved_indices) {
+            assert(idx < reserved.size());
+            reserved[idx] = 1;
         }
 
-        current = TimeMs{};
-        paused_time_ = TimeMs{};
+        fl.clear();
+        fl.reserve(events.size());
+
+        for (uint32_t i = 0; i < events.size(); ++i) {
+            Event &e = events[i];
+            e.status = EventStatus::Cancelled;
+            gens[i] += pending_clear; // 一次性加够
+
+            // 只有未被预定的槽位可以进入 free list
+            if (!reserved[i]) fl.push_back(i);
+        }
+
         alive = 0;
         cancelled = 0;
         fire_count = 0;
-        return true;
     }
 
     bool try_skip_repeat() {
@@ -228,6 +255,19 @@ private:
         assert(e.desc.type == EventType::Repeat);
         e.next_fire += e.desc.interval_ms;
         pq.push(eid);
+    }
+
+    void default_clear() {
+        events.clear();
+        PQ tmp{EventCompare(events)};
+        pq.swap(tmp);
+        fl.clear();
+        gens.clear();
+        assert(delay_ops.empty());
+        alive = 0;
+        cancelled = 0;
+        fire_count = 0;
+        assert(!ticking);
     }
 
     template <typename F>
@@ -271,10 +311,10 @@ public:
         assert(!(ticking == false && pending_clear != 0));
         assert(eid.gen == gens[eid.index]);
         eid.gen += pending_clear;
-        gens[eid.index] += pending_clear;
+        // 不给 gens 加偏移，因为 flush 的时候会加上
 
-        if (try_add_ops(OpType::Add, next_fire, std::move(d), eid)) return eid;
-        set_event(next_fire, std::move(d), eid);
+        if (ticking) add_schedule(next_fire, std::move(d), eid);
+        else set_event(next_fire, std::move(d), eid);
         return eid;
     }
 
@@ -303,7 +343,8 @@ public:
         if (e.status != EventStatus::Alive) return;
 
         try {
-            call(d.callback, top); // 这里 call 之后事件不一定仍为 Alive 状态
+            // call 后事件不一定仍为 Alive
+            call(d.callback, top);
         } catch (...) {
             // 若在此处捕获，说明 Policy 为 rethrow
             if (e.status == EventStatus::Cancelled) throw;
@@ -311,7 +352,6 @@ public:
             else reuse_once(top);
             throw;
         }
-
         if (e.status == EventStatus::Cancelled) return;
         if (d.type == EventType::Repeat) reschedule(top);
         else reuse_once(top);
@@ -380,7 +420,7 @@ public:
     auto peek() const noexcept -> std::optional<std::pair<EventID, TimeMs>> {
         if (pq.empty()) return std::nullopt;
         EventID eid = pq.top();
-        const Event &e = events[eid];
+        const Event &e = events[eid.index];
         return {eid, e.next_fire};
     }
 
@@ -409,21 +449,8 @@ public:
     // 清空所有事件
     void clear() noexcept {
         // 处理 ticking 情况
-        if (try_add_ops(OpType::Clear)) return;
-
-        events.clear();
-        PQ tmp{EventCompare(events)};
-        pq.swap(tmp);
-        fl.clear();
-        gens.clear();
-        assert(delay_ops.empty());
-        current = TimeMs{};
-        paused_time_ = TimeMs{};
-        alive = 0;
-        cancelled = 0;
-        fire_count = 0;
-        paused = false;
-        assert(!ticking);
+        if (ticking) add_clear();
+        else default_clear();
     }
 
     // 暂停/恢复
@@ -441,9 +468,9 @@ public:
         assert(eid.is_valid());
         assert(is_alive(eid));
     }
-    std::ostringstream _print_top() const noexcept {
+    std::ostringstream _top_info() const noexcept {
         EventID top = pq.top();
-        const Event &e = events[top];
+        const Event &e = events[top.index];
         std::ostringstream oss;
         oss << "top event idx:       " << top.index << std::endl;
         oss << "top event status:    " << (e.status == EventStatus::Alive ? "Alive" : "Cancelled") << std::endl;
@@ -516,8 +543,8 @@ private:
     TimeMs paused_time_{};
     size_t alive{};
     size_t cancelled{};
-    size_t pending_clear{}; // delay ops 中未执行的 clear，用于防止 gen 漂移
     size_t fire_count{};
+    uint32_t pending_clear{}; // delay ops 中未执行的 clear，用于防止 gen 漂移
     bool paused = false;
     bool ticking = false;
 };
