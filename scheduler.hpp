@@ -3,9 +3,8 @@
 #include "event.hpp"
 #include "event_id.hpp"
 #include <cassert>
-#include <cstddef>
 #include <cstdint>
-#include <ctime>
+#include <deque>
 #include <iostream>
 #include <optional>
 #include <queue>
@@ -16,7 +15,7 @@
 namespace es {
 
 enum class EventStatus : uint8_t { Alive, Cancelled };
-enum class OpType : uint8_t { Schedule, Clear };
+enum class OpType : uint8_t { Schedule, Clear, Delay };
 
 template <typename Callback = DefaultCallback> class EventScheduler {
 
@@ -51,7 +50,7 @@ template <typename Callback = DefaultCallback> class EventScheduler {
 
     struct Op {
         OpType op_type;
-        // for schedule
+        // for schedule || set next fire
         TimeMs next_fire;
         Desc desc;
         EventID eid;
@@ -60,14 +59,15 @@ template <typename Callback = DefaultCallback> class EventScheduler {
     struct TickGuard {
         EventScheduler *es;
         explicit TickGuard(EventScheduler *_es) : es(_es) {
+            assert(!es->ticking);
             es->ticking = true;
             assert(es->delay_ops.empty());
             assert(es->pending_clear == 0);
         }
         ~TickGuard() {
-            es->ticking = false;
             es->flush_delay_ops();
             es->pending_clear = 0;
+            es->ticking = false;
         }
     };
 
@@ -95,7 +95,7 @@ private:
             if constexpr (std::is_invocable_r_v<void, F &>) f();
             else if (std::is_invocable_r_v<void, F &, EventID>) f(eid);
         } catch (...) {
-            if (ep == ExceptionPolicy::CancelEvent) cancel(eid);
+            if (ep == ExceptionPolicy::Cancel) cancel(eid);
             else if (ep == ExceptionPolicy::Rethrow) throw;
         }
     }
@@ -108,14 +108,12 @@ private:
         return eid;
     }
 
-    // 回收 Once 事件
-    void reuse_once(EventID eid) noexcept {
+    void reuse(EventID eid) noexcept {
         Event &e = events[eid.index];
-        assert(e.status == EventStatus::Alive);
-        e.status = EventStatus::Cancelled; // 不再 Alive
+        if (e.status == EventStatus::Alive) --alive;
+        e.status = EventStatus::Cancelled;
         fl.push_back(eid.index);
         ++gens[eid.index];
-        --alive;
     }
 
     // pop 不增加 gen
@@ -151,6 +149,15 @@ private:
         return true;
     }
 
+    void add_schedule(TimeMs next_fire, Desc &&d, EventID eid) {
+        Op op;
+        op.op_type = OpType::Schedule;
+        op.next_fire = next_fire;
+        op.desc = std::move(d);
+        op.eid = eid;
+        delay_ops.emplace_back(std::move(op));
+    }
+
     void add_clear() {
         ++pending_clear;
         delay_ops.clear(); // 最后一次 clear 之前的操作都是没有意义的
@@ -159,12 +166,11 @@ private:
         delay_ops.emplace_back(std::move(op));
     }
 
-    void add_schedule(TimeMs next_fire, Desc &&d, EventID eid) {
+    void add_delay(EventID eid, TimeMs next_fire) {
         Op op;
-        op.op_type = OpType::Schedule;
-        op.next_fire = next_fire;
-        op.desc = std::move(d);
+        op.op_type = OpType::Delay;
         op.eid = eid;
+        op.next_fire = next_fire;
         delay_ops.emplace_back(std::move(op));
     }
 
@@ -187,8 +193,9 @@ private:
         ops.swap(delay_ops); // 清空 delay_ops 同时仍能继续遍历
         for (size_t i = 0; i < ops.size(); ++i) {
             Op &op = ops[i];
-            if (op.op_type == OpType::Clear) handle_clear_op(ops, i);
-            else set_event(op.next_fire, std::move(op.desc), op.eid);
+            if (op.op_type == OpType::Schedule) set_event(op.next_fire, std::move(op.desc), op.eid);
+            else if (op.op_type == OpType::Clear) handle_clear_op(ops, i);
+            else default_set_next_fire(op.eid, op.next_fire);
         }
     }
 
@@ -232,8 +239,8 @@ private:
         // 把 Repeat 类的事件的 next_fire 更新到最后一次触发时刻
         TimeMs delta = current - e.next_fire;
         if (delta <= 0) return false;
-        int ts = static_cast<int>(delta / d.interval_ms); // 周期
-        if (ts == 0) return false;                        // 确保会被触发
+        int64_t ts = static_cast<int64_t>(delta / d.interval_ms); // 周期
+        if (ts == 0) return false;                                // 确保会被触发
 
         pq.pop();
         e.next_fire += ts * d.interval_ms;
@@ -268,6 +275,16 @@ private:
         cancelled = 0;
         fire_count = 0;
         assert(!ticking);
+    }
+
+    void default_set_next_fire(EventID eid, TimeMs next_fire) {
+        Event &e = events[eid.index];
+        EventID new_id;
+        new_id.index = eid.index;
+        new_id.gen = eid.gen + 1;
+        ++gens[eid.index]; // 把堆中原有事件标记为旧事件
+        pq.push(new_id);   // 添加新的事件
+        e.next_fire = next_fire;
     }
 
     template <typename F>
@@ -328,9 +345,10 @@ public:
     template <typename F>
     EventID schedule(TimeMs time_ms, F &&f, TimeMode mode = TimeMode::Relative, EventType type = EventType::Once,
                      TimeMs interval_ms = TimeMs{}, ExceptionPolicy ep = ExceptionPolicy::Swallow,
-                     EventPriority pri = EventPriority::User) {
-        if (mode == TimeMode ::Relative) return schedule_after(time_ms, std::forward<F>(f), type, interval_ms, ep, pri);
-        return schedule_at(time_ms, std::forward<F>(f), type, interval_ms, ep, pri);
+                     EventPriority pri = EventPriority::User, CatchUp cu = CatchUp::All) {
+        if (mode == TimeMode::Relative)
+            return schedule_after(time_ms, std::forward<F>(f), type, interval_ms, ep, pri, cu);
+        return schedule_at(time_ms, std::forward<F>(f), type, interval_ms, ep, pri, cu);
     }
 
     void fire_top() {
@@ -347,14 +365,12 @@ public:
             call(d.callback, top);
         } catch (...) {
             // 若在此处捕获，说明 Policy 为 rethrow
-            if (e.status == EventStatus::Cancelled) throw;
-            if (d.type == EventType::Repeat) reschedule(top);
-            else reuse_once(top);
+            if (d.type == EventType::Repeat && e.status != EventStatus::Cancelled) reschedule(top);
+            else reuse(top);
             throw;
         }
-        if (e.status == EventStatus::Cancelled) return;
-        if (d.type == EventType::Repeat) reschedule(top);
-        else reuse_once(top);
+        if (d.type == EventType::Repeat && e.status != EventStatus::Cancelled) reschedule(top);
+        else reuse(top);
     }
 
     // 取消事件，若已经非活跃，返回 false
@@ -394,6 +410,7 @@ public:
 
     // 推进时间
     void tick(TimeMs delta_ms) {
+        assert(!ticking);
         if (try_update_pause(delta_ms)) return;
         TickGuard tg(this); // RAII guard
         current += delta_ms;
@@ -425,6 +442,7 @@ public:
     }
 
     void run() {
+        assert(!ticking);
         if (paused) return;
         TickGuard tg(this);
         while (!pq.empty()) {
@@ -523,14 +541,9 @@ public:
         _assert_eid(eid);
         Event &e = events[eid.index];
         if (e.next_fire == next_fire) return;
-
-        EventID new_id;
-        new_id.index = eid.index;
-        new_id.gen = eid.gen + 1;
-        ++gens[eid.index];
-        pq.push(new_id); // 添加新的事件
-
-        e.next_fire = next_fire;
+        // 只有 ticking 且提早事件发生时间到 current 之前的操作才有必要进入 delay ops
+        if (ticking && next_fire <= current) add_delay(eid, next_fire);
+        else default_set_next_fire();
     }
 
 private:

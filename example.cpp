@@ -9,6 +9,7 @@
 #include <iostream>
 #include <random>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -227,7 +228,7 @@ static void test_exception_policy_swallow_and_cancel_event() {
                 ++fired;
                 throw std::runtime_error("boom");
             },
-            TimeMode::Relative, EventType::Repeat, 10, ExceptionPolicy::CancelEvent, EventPriority::User);
+            TimeMode::Relative, EventType::Repeat, 10, ExceptionPolicy::Cancel, EventPriority::User);
 
         s.tick(100);
         EXPECT_EQ(fired, size_t(1));
